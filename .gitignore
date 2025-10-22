@@ -11,3 +11,12 @@ wheels/
 
 # output
 output
+
+# env
+.env
+
+# tmp
+tmp
+
+# vscode
+.vscode
