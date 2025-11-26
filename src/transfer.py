@@ -2,11 +2,15 @@
 import re
 import shutil
 import sys
+import unicodedata
 from dataclasses import dataclass
 from pathlib import Path
-from typing import ClassVar
+from typing import Any, Callable, ClassVar
 
+import numpy as np
 import pandas as pd
+
+from src.schema import SCAN_REPORT_COLUMNS, SCHEMAS
 
 
 @dataclass
@@ -19,52 +23,6 @@ class ProcessingResult:
 
 
 class ScanReportProcessor:
-    # Schema definitions based on table definitions in docs/transfer.md
-    SCHEMAS: ClassVar[dict[str, dict]] = {
-        "scan_report_daily": {
-            "columns": [
-                "scan_date",
-                "point_card_id",
-                "store_id",
-                "employee_id",
-                "shoe_sold",
-                "shoe_exist_in_db",
-                "shoes_marked_sold_rwa",
-                "insole_sold",
-                "shoe_functional",
-                "size_recommendation",
-                "safesize_code",
-                "scanner_id",
-            ],
-            "not_null": ["scan_date", "store_id", "employee_id", "safesize_code"],
-            "validations": {
-                "store_id": {"type": "numeric", "pattern": r"^[0-9]+$"},
-                "employee_id": {"type": "numeric", "pattern": r"^[0-9]{7}$"},
-            },
-        },
-        "scan_report_weekly": {
-            "columns": [
-                "scan_date",
-                "point_card_id",
-                "store_id",
-                "employee_id",
-                "shoe_sold",
-                "shoe_exist_in_db",
-                "shoes_marked_sold_rwa",
-                "insole_sold",
-                "shoe_functional",
-                "size_recommendation",
-                "safesize_code",
-                "scanner_id",
-            ],
-            "not_null": ["scan_date", "store_id", "employee_id", "safesize_code"],
-            "validations": {
-                "store_id": {"type": "numeric", "pattern": r"^[0-9]+$"},
-                "employee_id": {"type": "numeric", "pattern": r"^[0-9]{7}$"},
-            },
-        },
-    }
-
     COLUMN_ALIASES: ClassVar[dict[str, str]] = {
         "sspc": "point_card_id",
         "store_id": "store_id",
@@ -82,6 +40,22 @@ class ScanReportProcessor:
         "scan_date": "scan_date",
         "unnamed_11": "scan_date",
         "unnamed_11_": "scan_date",
+    }
+
+    COLUMN_TYPE_SPEC: ClassVar[dict[str, dict[str, Any]]] = {
+        "scan_date": {"type": "date"},
+        "point_card_id": {"type": "string", "max_length": 16},
+        "store_id": {"type": "string", "max_length": 6},
+        "employee_id": {"type": "string", "max_length": 7},
+        "shoe_sold": {"type": "int"},
+        "shoe_exist_in_db": {"type": "int"},
+        "shoes_marked_sold_rwa": {"type": "int"},
+        "insole_sold": {"type": "int"},
+        "shoe_functional": {"type": "int"},
+        "size_recommendation": {"type": "int"},
+        "safesize_code": {"type": "string", "max_length": 50},
+        "scanner_id": {"type": "string", "max_length": 50},
+        "created_at": {"type": "timestamptz"},
     }
 
     def __init__(
@@ -111,7 +85,7 @@ class ScanReportProcessor:
         """Get schema for a file based on its name"""
         # Remove .csv extension and check if schema exists
         base_name = Path(file_name).stem
-        return self.SCHEMAS.get(base_name)
+        return SCHEMAS.get(base_name)
 
     def validate_data_with_schema(
         self, df: pd.DataFrame, schema: dict
@@ -128,9 +102,14 @@ class ScanReportProcessor:
 
         # Check NOT NULL constraints
         for column in schema["not_null"]:
-            if column in df.columns:
-                null_mask = df[column].isna() | (df[column].astype(str).str.strip() == "")
-                append_error(null_mask, f"NOT NULL violation: {column}; ")
+            if column not in df.columns:
+                df[column] = pd.NA
+
+            series = df[column]
+            stringified = series.astype("string")
+            trimmed = stringified.str.strip()
+            null_mask = series.isna() | trimmed.fillna("").eq("")
+            append_error(null_mask, f"NOT NULL violation: {column}; ")
 
         # Apply field-specific validations
         for field, validation in schema.get("validations", {}).items():
@@ -149,6 +128,8 @@ class ScanReportProcessor:
                         error_msg = f"Invalid {field} (must be 7 digits)"
                     append_error(invalid_mask, error_msg + "; ")
 
+        type_conversions = self._validate_and_prepare_output_types(df, append_error)
+
         # Clean up error messages
         df["_error"] = df["_error"].str.rstrip("; ")
 
@@ -163,9 +144,95 @@ class ScanReportProcessor:
 
         # Remove error columns from clean data
         if not clean_df.empty:
+            for column, converted in type_conversions.items():
+                if column in clean_df.columns:
+                    clean_df[column] = converted.loc[clean_df.index]
             clean_df = clean_df.drop(columns=["_error", "_row_number"])
 
         return clean_df, invalid_df
+
+    def _validate_and_prepare_output_types(
+        self,
+        df: pd.DataFrame,
+        append_error: Callable[[pd.Series, str], None],
+    ) -> dict[str, pd.Series]:
+        conversions: dict[str, pd.Series] = {}
+
+        for column, spec in self.COLUMN_TYPE_SPEC.items():
+            if column not in df.columns:
+                continue
+
+            series = df[column]
+            conversions[column] = self._convert_column_for_output(
+                column,
+                series,
+                spec,
+                append_error,
+            )
+
+        return conversions
+
+    def _convert_column_for_output(
+        self,
+        column: str,
+        series: pd.Series,
+        spec: dict[str, Any],
+        append_error: Callable[[pd.Series, str], None],
+    ) -> pd.Series:
+        stringified = series.astype("string")
+        trimmed = stringified.str.strip()
+        non_empty = trimmed.notna() & trimmed.ne("")
+        cleaned = trimmed.where(non_empty, pd.NA)
+
+        match spec["type"]:
+            case "string":
+                max_length = spec.get("max_length")
+                if max_length is not None:
+                    too_long = non_empty & cleaned.str.len().gt(max_length)
+                    append_error(
+                        too_long,
+                        f"Invalid {column} (max {max_length} chars); ",
+                    )
+                return cleaned.astype("string")
+
+            case "int":
+                numeric = pd.to_numeric(cleaned, errors="coerce")
+                invalid_numeric = non_empty & numeric.isna()
+
+                fractional_mask = non_empty & ~invalid_numeric & ~np.isclose(
+                    numeric % 1, 0
+                )
+                invalid_mask = invalid_numeric | fractional_mask
+
+                append_error(invalid_mask, f"Invalid {column} (must be integer); ")
+
+                coerced = numeric.where(~invalid_mask)
+                return coerced.round().astype("Int64")
+
+            case "date":
+                parsed = pd.to_datetime(
+                    cleaned,
+                    errors="coerce",
+                    format="%Y-%m-%d",
+                )
+                invalid_mask = non_empty & parsed.isna()
+                append_error(
+                    invalid_mask,
+                    f"Invalid {column} (must be YYYY-MM-DD); ",
+                )
+                return parsed.dt.normalize()
+
+            case "timestamptz":
+                parsed = pd.to_datetime(cleaned, errors="coerce", utc=True)
+                invalid_mask = non_empty & parsed.isna()
+                append_error(
+                    invalid_mask,
+                    f"Invalid {column} (must be ISO 8601 timestamp); ",
+                )
+                return parsed
+
+            case _:
+                return series
 
     def _load_dataframe(self, file_path: Path) -> pd.DataFrame:
         """Load source data regardless of CSV or Excel extension."""
@@ -205,12 +272,77 @@ class ScanReportProcessor:
 
         return df.rename(columns=rename_map)
 
-    def process_input_file(self, csv_file: Path, schema: dict) -> tuple[pd.DataFrame, pd.DataFrame]:
+    @staticmethod
+    def _normalize_scanner_id_value(value: Any) -> object:
+        """Strip scanner IDs while keeping NULL allowance."""
+        if pd.isna(value):
+            return pd.NA
+
+        text = str(value).strip()
+        return text or pd.NA
+
+    @staticmethod
+    def _clean_store_id_value(value: Any) -> object:
+        """Normalize store IDs according to business rules."""
+        if pd.isna(value):
+            return pd.NA
+
+        text = str(value).strip()
+        if not text:
+            return pd.NA
+
+        # NFKC converts full-width characters (digits, spaces, parentheses) to ASCII.
+        text = unicodedata.normalize("NFKC", text)
+
+        # Remove parentheses introduced by text qualifiers or manual edits.
+        text = text.replace("(", "").replace(")", "")
+
+        # Collapse all types of whitespace inside the identifier.
+        text = re.sub(r"\s+", "", text)
+
+        # Business rule: drop leading zeros that appear due to import quirks.
+        text = text.lstrip("0")
+
+        if not text:
+            return pd.NA
+
+        return text
+
+    def _apply_domain_cleaning(self, df: pd.DataFrame) -> pd.DataFrame:
+        """Apply business-specific normalization prior to validation."""
+        cleaned = df.copy()
+
+        if "store_id" in cleaned.columns:
+            store_series = cleaned["store_id"].map(self._clean_store_id_value)
+            cleaned["store_id"] = store_series.astype("string")
+
+        if "scanner_id" in cleaned.columns:
+            scanner_series = cleaned["scanner_id"].map(self._normalize_scanner_id_value)
+            cleaned["scanner_id"] = scanner_series.astype("string")
+
+        return cleaned
+
+    def process_input_file(
+        self,
+        csv_file: Path,
+        schema: dict,
+        *,
+        scan_date: str | None = None,
+    ) -> tuple[pd.DataFrame, pd.DataFrame]:
         """Process a single tabular file with the given schema"""
         try:
             # Read CSV/Excel with UTF-8 BOM or Excel support
             df = self._load_dataframe(csv_file)
             df = self._normalize_dataframe_columns(df)
+            df = self._apply_domain_cleaning(df)
+
+            if scan_date is not None:
+                if "scan_date" not in df.columns:
+                    df["scan_date"] = scan_date
+                else:
+                    column = df["scan_date"].astype("string")
+                    mask = column.isna() | (column.str.strip() == "")
+                    df["scan_date"] = column.mask(mask, scan_date)
 
             # Validate and split data using schema
             clean_df, invalid_df = self.validate_data_with_schema(df, schema)
@@ -221,14 +353,27 @@ class ScanReportProcessor:
             print(f"Error processing file {csv_file}: {e}")
             raise
 
-    def process_file(self, csv_file: Path, schema: dict | None = None) -> ProcessingResult:
+    def process_file(
+        self,
+        csv_file: Path,
+        schema: dict | None = None,
+        *,
+        scan_date: str | None = None,
+    ) -> ProcessingResult:
         """Validate a file and optionally persist outputs"""
         target_schema = schema or self.get_schema_for_file(csv_file.name)
 
         if not target_schema:
             raise ValueError(f"No schema defined for file: {csv_file.name}")
 
-        clean_df, invalid_df = self.process_input_file(csv_file, target_schema)
+        clean_df, invalid_df = self.process_input_file(
+            csv_file,
+            target_schema,
+            scan_date=scan_date,
+        )
+
+        if not clean_df.empty:
+            clean_df = self._order_columns(clean_df)
 
         clean_output_path: Path | None = None
         invalid_output_path: Path | None = None
@@ -315,6 +460,12 @@ class ScanReportProcessor:
         if processed_count == 0:
             print("\nNo files with defined schemas found to process.")
 
+    @staticmethod
+    def _order_columns(df: pd.DataFrame) -> pd.DataFrame:
+        desired = [column for column in SCAN_REPORT_COLUMNS if column in df.columns]
+        remaining = [column for column in df.columns if column not in desired]
+        return df.loc[:, [*desired, *remaining]]
+
 
 def main():
     processor = ScanReportProcessor()
@@ -325,7 +476,7 @@ def main():
     print(f"Sample directory: {processor.sample_dir.absolute()}")
     print(f"Output directory: {processor.output_dir.absolute()}")
     print("Note: Output directory has been cleared")
-    print(f"Available schemas: {', '.join(processor.SCHEMAS.keys())}")
+    print(f"Available schemas: {', '.join(SCHEMAS.keys())}")
     print("-" * 60)
 
     try:

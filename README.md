@@ -13,6 +13,14 @@ uv run python etl.py --env-file .env --save-output
 Set the FTP and S3 credentials in `.env` (or export them) before running. Omit `--save-output` when running outside local development to skip writing processed CSVs to `output/`.
 Add `--today YYYY-MM-DD` to backfill for a specific reference date (interpreted in JST).
 
+## Bulk Backfill
+
+```bash
+uv run python etl_backfill.py --env-file .env --start-date 2023-03-04
+```
+
+Runs the ETL pipeline for every report date between the given start/end dates (defaults to 2023-03-04 through today in JST). Pass `--save-output` to persist each run's cleaned CSVs under `output/`.
+
 ## Development
 
 Use Ruff for both linting (flake8 + isort equivalent) and formatting:

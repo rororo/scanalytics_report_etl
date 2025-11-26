@@ -21,6 +21,9 @@ weekylyの場合は、YYYY-MM-DD の部分を、２つ目は直近の日曜日�
 
 transfer.py の処理で不正値を除去する
 ローカル開発の場合のみ、 output/ に結果を保存する。
+- 各ファイルの論理日付（daily: 前日、weekly: 対象週の日曜日）を `scan_date` 列に補完し、入力ファイルに既存値があれば尊重する。
+- アップロードする CSV の列順は以下で統一する:
+  `scan_date, point_card_id, store_id, employee_id, shoe_sold, shoe_exist_in_db, shoes_marked_sold_rwa, insole_sold, shoe_functional, size_recommendation, safesize_code, scanner_id, created_at`。
 
 #### 不正値除去の仕様
 
@@ -45,6 +48,7 @@ s3の接続情報は.env ファイルに記載されています。
 
 不正値除去済みのデータを CSV 形式に変換して s3 にアップロードする。
 アップロードするオブジェクトキーは必ず `.csv` 拡張子にしてください (ETL の実装で `.csv` 以外はエラーになります)。
+- 開発・検証時は `--dry-run` オプションを指定することで S3 へのアップロードをスキップし、ローカル出力の確認のみに留められる。
 
 - scan_report_daily: s3://redshift-dwh-prod-uploads/feetaxis/scan_report_daily_YYYYMMDD.csv
 - scan_report_weekly: s3://redshift-dwh-prod-uploads/feetaxis/scan_report_weekly_YYYYMMDD.csv
